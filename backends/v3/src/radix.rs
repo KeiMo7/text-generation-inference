@@ -206,6 +206,11 @@ impl Allocator for RadixAllocator {
             self.free_blocks.extend(blocks);
         }
     }
+
+    #[cfg(test)]
+    fn free_block_count(&self) -> usize {
+        self.free_blocks.len()
+    }
 }
 
 struct RadixAllocation {

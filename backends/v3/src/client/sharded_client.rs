@@ -24,6 +24,15 @@ impl ShardedClient {
         Self { clients }
     }
 
+    /// Test-only constructor: a client without any shard. It is only meant for
+    /// scheduler/admission tests that never issue an inference call.
+    #[cfg(test)]
+    pub(crate) fn empty_for_tests() -> Self {
+        Self {
+            clients: Vec::new(),
+        }
+    }
+
     /// Create a new ShardedClient from a master client. The master client will communicate with
     /// the other shards and returns all uris/unix sockets with the `service_discovery` gRPC method.
     async fn from_master_client(mut master_client: Client) -> Result<Self> {

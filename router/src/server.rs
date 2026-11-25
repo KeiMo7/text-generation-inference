@@ -2413,6 +2413,8 @@ impl From<InferError> for (StatusCode, Json<ErrorResponse>) {
             InferError::MissingTemplateVariable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             InferError::ToolError(_) => StatusCode::UNPROCESSABLE_ENTITY,
             InferError::StreamSerializationError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            InferError::QueueFull { .. } => StatusCode::TOO_MANY_REQUESTS,
+            InferError::RequestTooLarge { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         };
 
         (
@@ -2442,4 +2444,54 @@ pub enum WebServerError {
     Axum(#[from] axum::BoxError),
     #[error("Tokenizer error: {0}")]
     Tokenizer(String),
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+    use crate::infer::InferError;
+
+    #[test]
+    fn queue_full_maps_to_429_and_queue_full_type() {
+        let err = InferError::QueueFull { capacity: 4096 };
+        let (status, body) = err.into();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body.error_type, "queue_full");
+        assert!(body.error.contains("4096"));
+    }
+
+    #[test]
+    fn request_too_large_maps_to_422_and_request_too_large_type() {
+        let err = InferError::RequestTooLarge {
+            tokens: 128,
+            limit: 64,
+        };
+        let (status, body) = err.into();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body.error_type, "request_too_large");
+        assert!(body.error.contains("128"));
+        assert!(body.error.contains("64"));
+    }
+
+    #[test]
+    fn openai_events_carry_matching_status_codes() {
+        // The OpenAI SSE path and the REST path must agree on status codes.
+        let full = InferError::QueueFull { capacity: 1 };
+        assert_eq!(full.http_status_code(), 429);
+        assert_eq!(full.error_type(), "queue_full");
+        let (status, body) = full.into();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body.error_type, "queue_full");
+
+        let too_large = InferError::RequestTooLarge {
+            tokens: 2,
+            limit: 1,
+        };
+        assert_eq!(too_large.http_status_code(), 422);
+        assert_eq!(too_large.error_type(), "request_too_large");
+        let (status, body) = too_large.into();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body.error_type, "request_too_large");
+        assert!(body.error.contains('2'));
+    }
 }

@@ -425,10 +425,14 @@ pub enum InferError {
     ToolError(String),
     #[error("Stream event serialization error")]
     StreamSerializationError(String),
+    #[error("Queue is full (capacity: {capacity})")]
+    QueueFull { capacity: usize },
+    #[error("Request is too large: {tokens} tokens > maximum of {limit}")]
+    RequestTooLarge { tokens: u32, limit: u32 },
 }
 
 impl InferError {
-    pub(crate) fn error_type(&self) -> &str {
+    pub fn error_type(&self) -> &str {
         match self {
             InferError::GenerationError(_) => "generation",
             InferError::Overloaded(_) => "overloaded",
@@ -439,15 +443,35 @@ impl InferError {
             InferError::MissingTemplateVariable(_) => "missing_template_variable",
             InferError::ToolError(_) => "tool_error",
             InferError::StreamSerializationError(_) => "stream_serialization_error",
+            InferError::QueueFull { .. } => "queue_full",
+            InferError::RequestTooLarge { .. } => "request_too_large",
+        }
+    }
+
+    /// HTTP status code used by both the REST and the OpenAI-compatible SSE
+    /// error paths.
+    pub fn http_status_code(&self) -> u16 {
+        match self {
+            InferError::GenerationError(_) => 424,
+            InferError::Overloaded(_) | InferError::QueueFull { .. } => 429,
+            InferError::IncompleteGeneration
+            | InferError::IncompleteGenerationStream
+            | InferError::StreamSerializationError(_) => 500,
+            InferError::ValidationError(_)
+            | InferError::TemplateError(_)
+            | InferError::MissingTemplateVariable(_)
+            | InferError::ToolError(_)
+            | InferError::RequestTooLarge { .. } => 422,
         }
     }
 
     pub(crate) fn into_openai_event(self) -> Event {
+        let http_status_code = self.http_status_code() as usize;
         Event::default()
             .json_data(OpenaiErrorEvent {
                 error: APIError {
                     message: self.to_string(),
-                    http_status_code: 422,
+                    http_status_code,
                 },
             })
             .unwrap()

@@ -2,7 +2,9 @@
 use crate::client::{
     Batch, CachedBatch, ClientError, Generation, Health, InfoResponse, ShardedClient,
 };
-use crate::queue::{Entry, Queue};
+use crate::queue::{
+    CancelReason, Entry, EntryState, Queue, QueueConfig, QueueError, DEFAULT_PRIORITY,
+};
 use async_trait::async_trait;
 use nohash_hasher::IntMap;
 use std::sync::Arc;
@@ -11,7 +13,7 @@ use text_generation_router::validation::ValidGenerateRequest;
 use text_generation_router::{FinishReason, PrefillToken, Token};
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::{mpsc, Notify};
-use tokio::time::Instant;
+use tokio::time::{sleep, Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{info_span, instrument, Instrument, Span};
 
@@ -39,17 +41,20 @@ impl BackendV3 {
             tracing::warn!("Model supports prefill chunking. `waiting_served_ratio` and `max_waiting_tokens` will be ignored.");
         }
 
-        let block_size = shard_info.block_size;
-
-        let queue = Queue::new(
-            shard_info.requires_padding,
-            block_size,
-            shard_info.use_prefix_caching,
-            shard_info.window_size,
-            shard_info.speculate,
+        let config = QueueConfig {
+            requires_padding: shard_info.requires_padding,
+            block_size: shard_info.block_size,
+            prefix_caching: shard_info.use_prefix_caching,
+            window_size: shard_info.window_size,
+            speculate: shard_info.speculate,
             max_batch_total_tokens,
-            shard_info.support_chunking,
-        );
+            max_batch_prefill_tokens,
+            max_batch_size,
+            support_chunking: shard_info.support_chunking,
+            ..QueueConfig::default()
+        };
+        let retry_interval = config.retry_interval;
+        let queue = Queue::new(config);
         let batching_task_notifier = Arc::new(Notify::new());
 
         // Spawn batching background task that contains all the inference logic
@@ -63,6 +68,7 @@ impl BackendV3 {
             shard_info.support_chunking,
             queue.clone(),
             batching_task_notifier.clone(),
+            retry_interval,
         ));
 
         Self {
@@ -70,6 +76,25 @@ impl BackendV3 {
             batching_task_notifier,
             client,
         }
+    }
+
+    /// Test-only constructor: same wiring as [`BackendV3::new`] but without
+    /// spawning the batching task, so that admission control can be exercised
+    /// deterministically. The queue can be drained through [`Queue::cancel`] or
+    /// [`Queue::shutdown`].
+    #[cfg(test)]
+    pub(crate) fn for_schedule_tests(config: QueueConfig, client: ShardedClient) -> Self {
+        let queue = Queue::new(config);
+        Self {
+            queue,
+            batching_task_notifier: Arc::new(Notify::new()),
+            client,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue(&self) -> Queue {
+        self.queue.clone()
     }
 }
 
@@ -83,8 +108,16 @@ impl Backend for BackendV3 {
         // MPSC channel to communicate with the background batching task
         let (response_tx, response_rx) = mpsc::unbounded_channel();
 
-        // Append the request to the queue
-        self.queue.append(Entry {
+        // Append the request to the queue. Admission (id allocation, size and
+        // capacity checks) happens synchronously here.
+        let entry = Entry {
+            id: 0,
+            // Requests do not carry a priority yet; the queue clamps and owns
+            // the final value.
+            priority: DEFAULT_PRIORITY,
+            state: EntryState::Queued,
+            skipped: 0,
+            forced: false,
             request,
             response_tx,
             span: Span::current(),
@@ -92,10 +125,21 @@ impl Backend for BackendV3 {
             queue_time: Instant::now(),
             batch_time: None,
             block_allocation: None,
-        });
+        };
+        if let Err(err) = self.queue.append(entry) {
+            return Err(match err {
+                QueueError::Full { capacity } => InferError::QueueFull { capacity },
+                QueueError::RequestTooLarge { tokens, limit } => {
+                    InferError::RequestTooLarge { tokens, limit }
+                }
+                QueueError::Shutdown => {
+                    InferError::GenerationError("queue is shutting down".to_string())
+                }
+            });
+        }
 
-        // Notify the background task that we have a new entry in the queue that needs
-        // to be batched
+        // Notify the background task that we have a new entry in the queue that
+        // needs to be batched
         self.batching_task_notifier.notify_one();
 
         // Return stream
@@ -136,6 +180,7 @@ pub(crate) async fn batching_task(
     support_chunking: bool,
     queue: Queue,
     notifier: Arc<Notify>,
+    retry_interval: Duration,
 ) {
     // Infinite loop
     loop {
@@ -143,24 +188,31 @@ pub(crate) async fn batching_task(
         notifier.notified().await;
 
         // Get the next batch from the queue
-        // This batch might be smaller than the maximum batch size if there are not enough requests
-        // waiting in the queue
-        while let Some((mut entries, batch, span)) = queue
-            .next_batch(
-                None,
-                max_batch_size,
-                max_batch_prefill_tokens,
-                max_batch_total_tokens,
-            )
-            .await
+        // This batch might be smaller than the maximum batch size if there are
+        // not enough requests waiting in the queue
+        while let Some(next) = next_batch_with_retry(
+            &queue,
+            None,
+            max_batch_size,
+            max_batch_prefill_tokens,
+            max_batch_total_tokens,
+            &notifier,
+            retry_interval,
+        )
+        .await
         {
+            let Some((mut entries, batch, span)) = next else {
+                // Queue shut down.
+                return;
+            };
             let mut cached_batch = prefill(&mut client, batch, None, &mut entries)
                 .instrument(span)
                 .await;
             let mut waiting_tokens = 1;
 
-            // We loop until we do not receive any cached batch from the inference server (== until
-            // all requests have met their stopping criteria)
+            // We loop until we do not receive any cached batch from the
+            // inference server (== until all requests have met their stopping
+            // criteria)
             while let Some(batch) = cached_batch {
                 // Get current batch info
                 let batch_size = batch.size;
@@ -173,24 +225,27 @@ pub(crate) async fn batching_task(
                 let token_budget = max_batch_total_tokens.saturating_sub(batch_max_tokens);
 
                 let (min_size, max_size, prefill_token_budget) = if support_chunking {
-                    // Since the next batch will be concatenated with the current batch,
-                    // the current batch tokens must be subtracted to the prefill budget
+                    // Since the next batch will be concatenated with the
+                    // current batch, the current batch tokens must be
+                    // subtracted to the prefill budget
                     let prefill_token_budget =
                         max_batch_prefill_tokens.saturating_sub(current_tokens);
                     // We can ignore min_size and max_size
                     // Models than rely on max_size cannot support chunking
-                    // Regarding min_size, chunking allow us to consistently run at the compute
-                    // bound, making min_size useless.
+                    // Regarding min_size, chunking allow us to consistently
+                    // run at the compute bound, making min_size useless.
                     (None, None, prefill_token_budget)
                 } else {
                     let min_size = if waiting_tokens >= max_waiting_tokens {
-                        // If we didn't onboard any new requests since >= max_waiting_tokens, we try
-                        // to add a new batch even though its size might be small
+                        // If we didn't onboard any new requests since >=
+                        // max_waiting_tokens, we try to add a new batch even
+                        // though its size might be small
                         None
                     } else {
                         // Minimum batch size
-                        // TODO: temporarily disable to avoid incorrect deallocation +
-                        //       reallocation when using prefix caching.
+                        // TODO: temporarily disable to avoid incorrect
+                        //       deallocation + reallocation when using prefix
+                        //       caching.
                         Some((batch_size as f32 * waiting_served_ratio).floor() as usize)
                     };
 
@@ -201,10 +256,21 @@ pub(crate) async fn batching_task(
                 };
 
                 // Try to get a new batch
-                if let Some((mut new_entries, new_batch, span)) = queue
-                    .next_batch(min_size, max_size, prefill_token_budget, token_budget)
-                    .await
+                if let Some(next) = next_batch_with_retry(
+                    &queue,
+                    min_size,
+                    max_size,
+                    prefill_token_budget,
+                    token_budget,
+                    &notifier,
+                    retry_interval,
+                )
+                .await
                 {
+                    let Some((mut new_entries, new_batch, span)) = next else {
+                        // Queue shut down.
+                        return;
+                    };
                     // Tracking metrics
                     if min_size.is_some() {
                         metrics::counter!("tgi_batch_concat", "reason" => "backpressure")
@@ -221,10 +287,12 @@ pub(crate) async fn batching_task(
                     let new_cached_batch = if support_chunking {
                         // Get cached batch
                         let cached_batch = batches.pop();
-                        // Extend entries with the new entries since the batch will be
-                        // concatenated during the prefill op server side
+                        // Extend entries with the new entries since the batch
+                        // will be concatenated during the prefill op server
+                        // side
                         entries.extend(new_entries);
-                        // Generate one token for both the cached batch and the new batch
+                        // Generate one token for both the cached batch and the
+                        // new batch
                         let new_cached_batch =
                             prefill(&mut client, new_batch, cached_batch, &mut entries)
                                 .instrument(span)
@@ -235,11 +303,12 @@ pub(crate) async fn batching_task(
                         }
                         new_cached_batch
                     } else {
-                        // Request are waiting because we cannot concatenate the batches if the
-                        // model/server does not support chunking
+                        // Request are waiting because we cannot concatenate
+                        // the batches if the model/server does not support
+                        // chunking
                         entries.iter_mut().for_each(|(_, entry)| {
-                            // Create a new span to add the info that this entry is waiting
-                            // because a new batch is being computed
+                            // Create a new span to add the info that this entry
+                            // is waiting because a new batch is being computed
                             let entry_waiting_span = info_span!(parent: &entry.span, "waiting");
                             // Add relationships
                             span.follows_from(&entry_waiting_span);
@@ -248,7 +317,8 @@ pub(crate) async fn batching_task(
                             entry.temp_span = Some(entry_waiting_span);
                         });
 
-                        // Generate one token for this new batch to have the attention past in cache
+                        // Generate one token for this new batch to have the
+                        // attention past in cache
                         let new_cached_batch =
                             prefill(&mut client, new_batch, None, &mut new_entries)
                                 .instrument(span)
@@ -293,6 +363,51 @@ pub(crate) async fn batching_task(
     }
 }
 
+/// Fetch the next batch, retrying while the queue holds entries but none can
+/// fit yet (e.g. block allocation failures). An empty queue parks on the
+/// notifier without any polling: the retry timer is only armed when
+/// [`Queue::len`] reports pending work.
+///
+/// Returns `None` when the queue shuts down and `Some(None)` is never
+/// produced: an empty batch is retried internally instead.
+async fn next_batch_with_retry(
+    queue: &Queue,
+    min_size: Option<usize>,
+    max_size: Option<usize>,
+    prefill_token_budget: u32,
+    token_budget: u32,
+    notifier: &Notify,
+    retry_interval: Duration,
+) -> Option<Option<(IntMap<u64, Entry>, Batch, Span)>> {
+    loop {
+        match queue
+            .next_batch(min_size, max_size, prefill_token_budget, token_budget)
+            .await
+        {
+            Ok(Some(next_batch)) => return Some(Some(next_batch)),
+            Ok(None) => {
+                // No work or nothing fit yet.
+                if queue.len() == 0 {
+                    // Empty queue: wait for an append without polling.
+                    notifier.notified().await;
+                    continue;
+                }
+                // Entries are waiting but could not be scheduled: retry after
+                // the configured delay, waking immediately on notification.
+                tokio::select! {
+                    _ = sleep(retry_interval) => {}
+                    _ = notifier.notified() => {}
+                }
+            }
+            Err(QueueError::Shutdown) => return None,
+            Err(err) => {
+                tracing::error!("Unexpected queue error: {err}");
+                return None;
+            }
+        }
+    }
+}
+
 #[instrument(skip_all)]
 async fn prefill(
     client: &mut ShardedClient,
@@ -330,9 +445,7 @@ async fn prefill(
         }
         // If we have an error, we discard the whole batch
         Err(err) => {
-            let _ = client.clear_cache(Some(batch_id)).await;
-            send_errors(err, entries);
-            metrics::counter!("tgi_batch_inference_failure", "method" => "prefill").increment(1);
+            handle_batch_failure(client, &[batch_id], entries, err, "prefill").await;
             None
         }
     }
@@ -374,46 +487,99 @@ async fn decode(
         }
         // If we have an error, we discard the whole batch
         Err(err) => {
-            for id in batch_ids {
-                let _ = client.clear_cache(Some(id)).await;
-            }
-            send_errors(err, entries);
-            metrics::counter!("tgi_batch_inference_failure", "method" => "decode").increment(1);
+            handle_batch_failure(client, &batch_ids, entries, err, "decode").await;
             None
         }
     }
 }
 
-/// Filter a `batch` and remove all requests not present in `entries`
+/// Shared failure handling for prefill/decode and cache management failures:
+/// best-effort clear every affected shard batch, then fail the entries that
+/// are still connected. Entries whose client disconnected are only reaped and
+/// never counted twice.
+async fn handle_batch_failure(
+    client: &mut ShardedClient,
+    batch_ids: &[u64],
+    entries: &mut IntMap<u64, Entry>,
+    error: ClientError,
+    method: &'static str,
+) {
+    // Clear each affected batch id one by one, best effort.
+    for id in batch_ids {
+        let _ = client.clear_cache(Some(*id)).await;
+    }
+    send_errors(error, entries);
+    metrics::counter!("tgi_batch_inference_failure", "method" => method).increment(1);
+}
+
+/// What the batching task should do with a cached batch before issuing the
+/// next decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilterPlan {
+    /// Every request in the batch is still active: forward the batch as-is.
+    Unchanged,
+    /// Some requests disappeared: retain only the deduplicated `keep` ids.
+    Filter { batch_id: u64, keep: Vec<u64> },
+    /// Every request disappeared: drop the shard cache and skip the decode.
+    ClearAll { batch_id: u64 },
+}
+
+/// Pure decision function describing how a cached batch must be filtered given
+/// the entries still tracked by the batching task. An id is kept only when the
+/// entry exists, is not in a terminal state and its response channel is still
+/// open; duplicates in `request_ids` collapse into a single retained id.
+pub(crate) fn plan_filter(cached_batch: &CachedBatch, entries: &IntMap<u64, Entry>) -> FilterPlan {
+    let batch_id = cached_batch.id;
+    let mut keep: Vec<u64> = Vec::with_capacity(cached_batch.request_ids.len());
+    for id in &cached_batch.request_ids {
+        let active = entries
+            .get(id)
+            .map(|entry| !entry.state.is_terminal() && !entry.response_tx.is_closed())
+            .unwrap_or(false);
+        if active && !keep.contains(id) {
+            keep.push(*id);
+        }
+    }
+
+    if keep.is_empty() {
+        FilterPlan::ClearAll { batch_id }
+    } else if keep.len() == cached_batch.request_ids.len() {
+        FilterPlan::Unchanged
+    } else {
+        FilterPlan::Filter { batch_id, keep }
+    }
+}
+
+/// Filter a `batch` and remove all requests not present in `entries`.
+///
+/// Cache management failures are surfaced to the caller instead of panicking
+/// so the whole batch can be discarded gracefully.
 #[instrument(skip_all)]
 async fn filter_batch(
     client: &mut ShardedClient,
     next_batch: Option<CachedBatch>,
     entries: &IntMap<u64, Entry>,
 ) -> Option<CachedBatch> {
-    let mut batch = next_batch?;
+    let batch = next_batch?;
 
-    // No need to filter
-    if batch.size as usize == entries.len() {
-        return Some(batch);
-    }
-
-    let id = batch.id;
-
-    // Retain only requests that are still in entries
-    batch.request_ids.retain(|id| entries.contains_key(id));
-
-    if batch.request_ids.is_empty() {
-        // All requests have been filtered out
-        // Next batch is now empty
-        // Clear it from the Python shards cache
-        // We unwrap here as we need to panic since we cannot recover if this method fails
-        client.clear_cache(Some(id)).await.unwrap();
-        None
-    } else {
-        // Filter Python shard cache
-        // We unwrap here as we need to panic since we cannot recover if this method fails
-        client.filter_batch(id, batch.request_ids).await.unwrap()
+    match plan_filter(&batch, entries) {
+        FilterPlan::Unchanged => Some(batch),
+        FilterPlan::ClearAll { batch_id } => {
+            // All requests have been filtered out: clear the Python shards
+            // cache. A failure here means the whole batch must be discarded.
+            if let Err(err) = client.clear_cache(Some(batch_id)).await {
+                tracing::error!("clear_cache failed for batch {batch_id}: {err}");
+            }
+            None
+        }
+        FilterPlan::Filter { batch_id, keep } => match client.filter_batch(batch_id, keep).await {
+            Ok(filtered) => filtered,
+            Err(err) => {
+                tracing::error!("filter_batch failed for batch {batch_id}: {err}");
+                let _ = client.clear_cache(Some(batch_id)).await;
+                None
+            }
+        },
     }
 }
 
@@ -423,23 +589,50 @@ async fn filter_batch(
 fn filter_send_generations(generations: Vec<Generation>, entries: &mut IntMap<u64, Entry>) {
     generations.into_iter().for_each(|generation| {
         let id = generation.request_id;
-        // Get entry
-        // We can `expect` here as the request id should always be in the entries
-        let entry = entries
-            .get(&id)
-            .expect("ID not found in entries. This is a bug.");
+        // Get entry. A missing id means the request was cancelled or already
+        // finished: the shard may still emit tokens for it, but they must not
+        // be sent.
+        let Some(entry) = entries.get(&id) else {
+            tracing::debug!(id, "Dropping generation for unknown/cancelled entry");
+            return;
+        };
+
+        // Cancellation wins over completion: never send anything (not even an
+        // `End`) on a closed or terminal entry. The dropped metric is recorded
+        // at most once per request, right here at the send checkpoint.
+        if entry.state.is_terminal() || entry.response_tx.is_closed() {
+            tracing::debug!(id, "Dropping generation for cancelled entry");
+            if let Some(mut entry) = entries.remove(&id) {
+                if !entry.state.is_terminal() {
+                    entry.state =
+                        EntryState::Cancelled(CancelReason::ClientDisconnected);
+                    metrics::counter!("tgi_request_failure", "err" => "dropped").increment(1);
+                }
+            }
+            return;
+        }
 
         // Create and enter a span to link this function back to the entry
         let _span = info_span!(parent: entry.temp_span.as_ref().expect("batch_span is None. This is a bug."), "send_generation", generation = ?generation).entered();
         // Send generation responses back to the infer task
-        // If the receive an error from the Flume channel, it means that the client dropped the
-        // request and we need to stop generating hence why we unwrap_or(true)
-        let stopped = send_responses(generation, entry).inspect_err(|_err| {
+        // If the receive an error from the Flume channel, it means that the
+        // client dropped the request and we need to stop generating hence why
+        // we unwrap_or(true)
+        let send_result = send_responses(generation, entry);
+        let failed = send_result.is_err();
+        let stopped = send_result.unwrap_or(true);
+        if failed {
             tracing::error!("Entry response channel error.");
             metrics::counter!("tgi_request_failure", "err" => "dropped").increment(1);
-        }).unwrap_or(true);
+        }
         if stopped {
-            entries.remove(&id).expect("ID not found in entries. This is a bug.");
+            if let Some(mut entry) = entries.remove(&id) {
+                entry.state = if failed {
+                    EntryState::Cancelled(CancelReason::ClientDisconnected)
+                } else {
+                    EntryState::Finished
+                };
+            }
         }
     });
 }
@@ -449,9 +642,9 @@ fn send_responses(
     generation: Generation,
     entry: &Entry,
 ) -> Result<bool, Box<SendError<Result<InferStreamResponse, InferError>>>> {
-    // Return directly if the channel is disconnected
+    // Return directly if the channel is disconnected. Dropped accounting is
+    // owned by the caller (`filter_send_generations`) so it is recorded once.
     if entry.response_tx.is_closed() {
-        metrics::counter!("tgi_request_failure", "err" => "dropped").increment(1);
         return Ok(true);
     }
 
@@ -459,7 +652,8 @@ fn send_responses(
 
     if let Some(prefill_tokens) = generation.prefill_tokens {
         // Create Token objects
-        // We do that here instead of in the Python code as Rust for loops are faster
+        // We do that here instead of in the Python code as Rust for loops are
+        // faster
         let prefill_tokens = prefill_tokens
             .ids
             .into_iter()
@@ -538,18 +732,22 @@ fn send_responses(
 /// Send errors to Infer for all `entries`
 #[instrument(skip_all)]
 fn send_errors(error: ClientError, entries: &mut IntMap<u64, Entry>) {
-    entries.drain().for_each(|(_, entry)| {
+    entries.drain().for_each(|(_, mut entry)| {
+        // Cancelled entries only have their resources reaped: they must not
+        // receive an additional error and dropped is counted at most once.
+        if entry.state.is_terminal() || entry.response_tx.is_closed() {
+            tracing::debug!("Skipping error send for cancelled entry {}", entry.id);
+            return;
+        }
         // Create and enter a span to link this function back to the entry
         let _send_error_span = info_span!(parent: entry.temp_span.as_ref().expect("batch_span is None. This is a bug."), "send_error").entered();
         let err = InferError::GenerationError(error.to_string());
         metrics::counter!("tgi_request_failure", "err" => "generation").increment(1);
         tracing::error!("{err}");
+        entry.state = EntryState::Finished;
 
         // unwrap_or is valid here as we don't care if the receiver is gone.
-        entry
-            .response_tx
-            .send(Err(err))
-            .unwrap_or(());
+        entry.response_tx.send(Err(err)).unwrap_or(());
     });
 }
 
@@ -567,6 +765,193 @@ impl From<crate::client::GeneratedText> for GeneratedText {
             generated_tokens: value.generated_tokens,
             finish_reason,
             seed: value.seed,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::CachedBatch;
+
+    fn cached_batch(id: u64, request_ids: Vec<u64>) -> CachedBatch {
+        CachedBatch {
+            id,
+            request_ids,
+            size: 0,
+            max_tokens: 0,
+            current_tokens: 0,
+        }
+    }
+
+    fn open_entry(
+        id: u64,
+    ) -> (
+        Entry,
+        mpsc::UnboundedReceiver<Result<InferStreamResponse, InferError>>,
+    ) {
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        let entry = Entry {
+            id,
+            priority: 1,
+            state: EntryState::Running,
+            skipped: 0,
+            forced: false,
+            request: tests_support::valid_request(),
+            response_tx,
+            span: Span::none(),
+            temp_span: None,
+            queue_time: Instant::now(),
+            batch_time: None,
+            block_allocation: None,
+        };
+        (entry, response_rx)
+    }
+
+    #[test]
+    fn plan_filter_clear_all_when_every_channel_is_closed() {
+        let (entry0, _guard0) = open_entry(0);
+        let (entry1, _guard1) = open_entry(1);
+        let mut entries = IntMap::default();
+        entries.insert(0, entry0);
+        entries.insert(1, entry1);
+        // Dropping both receivers closes the response channels.
+        drop(_guard0);
+        drop(_guard1);
+
+        let plan = plan_filter(&cached_batch(7, vec![0, 1]), &entries);
+        assert_eq!(plan, FilterPlan::ClearAll { batch_id: 7 });
+    }
+
+    #[test]
+    fn plan_filter_keeps_deduplicated_active_ids() {
+        let (entry0, _guard0) = open_entry(0);
+        let (entry1, _guard1) = open_entry(1);
+        let mut entries = IntMap::default();
+        entries.insert(0, entry0);
+        entries.insert(1, entry1);
+        drop(_guard0);
+
+        let plan = plan_filter(&cached_batch(7, vec![0, 1, 1]), &entries);
+        assert_eq!(
+            plan,
+            FilterPlan::Filter {
+                batch_id: 7,
+                keep: vec![1]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_filter_unchanged_when_all_active() {
+        let (entry0, _guard0) = open_entry(0);
+        let (entry1, _guard1) = open_entry(1);
+        let mut entries = IntMap::default();
+        entries.insert(0, entry0);
+        entries.insert(1, entry1);
+
+        let plan = plan_filter(&cached_batch(7, vec![0, 1]), &entries);
+        assert_eq!(plan, FilterPlan::Unchanged);
+        // Guards must outlive the plan check.
+        drop(_guard0);
+        drop(_guard1);
+    }
+
+    /// Minimal request builder for plan_filter tests without pulling the full
+    /// router validation machinery.
+    mod tests_support {
+        use std::sync::Arc;
+        use text_generation_router::validation::{
+            ValidGenerateRequest, ValidParameters, ValidStoppingParameters,
+        };
+
+        pub(super) fn valid_request() -> ValidGenerateRequest {
+            ValidGenerateRequest {
+                inputs: vec![],
+                input_ids: Some(Arc::new(vec![])),
+                input_length: 1,
+                add_special_tokens: true,
+                truncate: 0,
+                decoder_input_details: false,
+                parameters: ValidParameters {
+                    temperature: 0.0,
+                    top_k: 0,
+                    top_p: 0.0,
+                    typical_p: 0.0,
+                    do_sample: false,
+                    seed: 0,
+                    repetition_penalty: 0.0,
+                    frequency_penalty: 0.0,
+                    watermark: false,
+                    grammar: None,
+                },
+                stopping_parameters: ValidStoppingParameters {
+                    ignore_eos_token: false,
+                    max_new_tokens: 1,
+                    max_total_new_tokens: 1024,
+                    stop_sequences: vec![],
+                },
+                top_n_tokens: 0,
+                adapter_id: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_rejects_with_queue_full_then_accepts_again() {
+        let config = QueueConfig {
+            max_queue_size: 1,
+            ..crate::queue::QueueConfig::default()
+        };
+        let backend = BackendV3::for_schedule_tests(config, ShardedClient::empty_for_tests());
+
+        let first_stream = backend.schedule(tests_support::valid_request());
+        assert!(first_stream.is_ok(), "first request must be admitted");
+
+        // The second request hits the capacity limit.
+        let err = backend
+            .schedule(tests_support::valid_request())
+            .expect_err("second request must be rejected");
+        assert!(matches!(err, InferError::QueueFull { capacity: 1 }));
+        assert_eq!(err.error_type(), "queue_full");
+
+        // Disconnect the first request's stream: the queue task reaps it at
+        // the next scan, freeing the slot.
+        drop(first_stream);
+        let queue = backend.queue();
+        // Park-and-reap: a scan observes the closed channel and drops the
+        // entry without producing a batch.
+        assert!(queue.next_batch(None, None, 1, 1).await.unwrap().is_none());
+        assert_eq!(queue.len(), 0);
+
+        // The queue accepts new work again.
+        let third_stream = backend.schedule(tests_support::valid_request());
+        assert!(third_stream.is_ok(), "queue must admit after reaping");
+        let stats = queue.stats().await.unwrap();
+        assert_eq!(stats.queued, 1);
+        assert_eq!(stats.dropped_queued, 1);
+        drop(third_stream);
+    }
+
+    #[tokio::test]
+    async fn schedule_rejects_oversized_request() {
+        let mut request = tests_support::valid_request();
+        request.input_length = 32;
+        request.stopping_parameters.max_new_tokens = 32;
+        let config = QueueConfig {
+            max_batch_total_tokens: 16,
+            max_batch_prefill_tokens: 16,
+            ..crate::queue::QueueConfig::default()
+        };
+        let backend = BackendV3::for_schedule_tests(config, ShardedClient::empty_for_tests());
+
+        let err = backend.schedule(request).expect_err("oversized request");
+        match err {
+            InferError::RequestTooLarge { tokens, limit } => {
+                assert_eq!(tokens, 64);
+                assert_eq!(limit, 16);
+            }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 }
